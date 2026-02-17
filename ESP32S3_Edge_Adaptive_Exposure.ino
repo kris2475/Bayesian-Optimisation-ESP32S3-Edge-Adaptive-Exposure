@@ -1,5 +1,5 @@
 /**
- * @file BO-S3_Edge_Adaptive_Exposure.ino
+ * @file ESP32_Edge_Adaptive_Exposure.ino
  * @project BO-S3: Edge Adaptive Exposure
  * @date 2026-02-17
  * * DESCRIPTION:
