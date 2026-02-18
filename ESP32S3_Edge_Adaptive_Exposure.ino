@@ -1,4 +1,5 @@
 /**************************************************************************************
+ * NOTE: BO INSPIRED
  *
  *  BO_Adaptive_Exposure_Timelapse_Grayscale.ino
  *
