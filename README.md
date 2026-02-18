@@ -1,120 +1,204 @@
 # Bayesian-Optimisation-ESP32S3-Edge-Adaptive-Exposure
 
-**BO-S3** is an on-device, autonomous camera tuning system developed for the **Seeed Studio XIAO ESP32-S3 Sense**. It replaces standard "average brightness" auto-exposure algorithms with a **Bayesian Optimisation (BO)** loop that maximises image detail (sharpness) rather than simple luminance.
+**BO-S3 (Embedded Variant)** is a lightweight, on-device adaptive exposure system for the Seeed Studio XIAO ESP32-S3 Sense.
 
-By treating the camera registers as a "Black Box" function, the system intelligently explores the relationship between Exposure and Gain to find the global maximum of image quality in fewer than 20 iterations.
+It replaces traditional brightness-based auto-exposure with a Bayesian-inspired optimisation loop that maximises image detail (edge density) rather than average luminance.
 
----
-
-## Technical Overview
-
-Traditional auto-exposure logic often fails in high-dynamic-range (HDR) or backlit conditions because it targets a mid-grey average. **BO-S3** solves this by:
-
-1.  **Defining a Quality Metric:** Utilising the **Laplacian Variance** of the image buffer to quantify edge density and detail.
-2.  **Global Search:** Implementing a **Gaussian Process (GP)** surrogate model to map the 2D parameter space (Exposure vs. Gain).
-3.  **Smart Sampling:** Employing the **Upper Confidence Bound (UCB)** acquisition function to balance the exploration of unknown settings with the exploitation of known high-performing settings.
+This implementation is intentionally engineered for embedded reliability, deterministic memory usage, and long-duration timelapse stability — not full academic Gaussian Process regression.
 
 ---
 
-## Hardware Requirements
+# What This Project Is — and Is Not
 
-* **Microcontroller:** Seeed Studio XIAO ESP32-S3 Sense
-* **Sensor:** OV2640 Camera Module (included)
-* **Memory:** 8MB PSRAM (Crucial for storing the GP covariance matrix and frame buffers)
+## ✅ What It Is
 
----
+- A 1D Bayesian-inspired optimiser
+- Optimises manual exposure (`aec_value`)
+- Uses a kernel-based surrogate model
+- Uses Upper Confidence Bound (UCB) acquisition
+- Uses a fast edge-density sharpness metric
+- Runs entirely on-device
+- Designed for minute-scale timelapse stability
 
-## System Architecture
+## ❌ What It Is Not
 
-The project operates in a closed-loop "Observe-Think-Act" cycle entirely on the ESP32-S3 silicon:
+- Not a full Gaussian Process regression
+- Not a 2D optimiser (gain is not optimised)
+- No covariance matrix construction
+- No matrix inversion
+- No Expected Improvement (EI)
+- No heavy PSRAM linear algebra
+- No full Laplacian variance convolution
 
-* **ACT:** Manipulate manual camera registers (`aec_value` for exposure, `agc_value` for gain).
-* **OBSERVE:** Capture a grayscale QVGA frame and calculate the Laplacian Variance.
-* **THINK:** Update the Gaussian Process. The system calculates the next optimal sample point based on the **Expected Improvement**.
-
-
-
----
-
-## Key Features
-
-* **Pure Edge Implementation:** No cloud, no Wi-Fi, and no external PC required for the linear algebra.
-* **PSRAM Optimised:** Leverages external RAM to handle larger matrices, improving the precision and depth of the Gaussian Process.
-* **Hardware Acceleration:** Utilises the ESP32-S3's dual-core LX7 processor to manage concurrent image processing and matrix inversion.
-* **Utilitarian Design:** Engineered for efficiency, reminiscent of high-stakes "one-shot" environments where every sample must be meaningful.
+This is Bayesian-inspired optimisation adapted for microcontroller constraints.
 
 ---
 
-## Objective Function: Laplacian Variance
+# Why This Design Exists
 
-The system maximises the variance of the Laplacian operator $\nabla^2 I$:
+The XIAO ESP32-S3 Sense is powerful for its size, but:
 
-$$y = \text{Var}(\nabla^2 I) = E[(\nabla^2 I)^2] - (E[\nabla^2 I])^2$$
+- PSRAM bandwidth is limited
+- Frame buffer memory must remain stable
+- Matrix inversion scales O(n³)
+- Long-running timelapse systems must avoid heap fragmentation
+- Deterministic timing is critical
 
-A higher value indicates a sharp, well-exposed image with high detail. A lower value indicates an image that is either "crushed" (underexposed), "blown out" (overexposed), or out of focus.
+A full Gaussian Process implementation with covariance matrix inversion on every iteration would:
 
+- Increase PSRAM pressure
+- Risk watchdog resets
+- Increase power consumption
+- Compromise long-duration stability
 
----
-### Laplacian Variance
-
-In engineering terms, the **Laplacian Variance** is a "Sharpness Scorer". It acts as a mathematical sensor that tells you how much high-frequency information (detail) is present in a signal. For the **BO-S3** project, this is the most critical part: it is the **Objective Function** that the Bayesian loop is trying to maximise.
-
----
-
-#### 1. The Laplacian Operator ($\nabla^2$)
-Think of the Laplacian as a **Second-Order Derivative** in 2D space. 
-
-* **1st Derivative (Gradient):** Measures the *rate of change* (how quickly brightness changes).
-* **2nd Derivative (Laplacian):** Measures the *rate of the rate of change* (how "sharp" or "abrupt" that change is).
-
-In an image, an edge (like the rim of a coffee cup) is a sudden change in pixel intensity. The Laplacian filter highlights these edges. In a blurry or poorly exposed image, these transitions are "soft" or non-existent, so the Laplacian response is weak.
-
-
+Instead, this system uses a resource-aware surrogate approximation that preserves the spirit of Bayesian Optimisation without the computational burden.
 
 ---
 
-#### 2. The Convolution Kernel
-On the ESP32, we do not perform complex calculus. We use a **Discrete Convolution Kernel**. It is a 3x3 matrix that slides over every pixel:
+# Core Concept
 
-$$\begin{bmatrix} 
-0 & 1 & 0 \\
-1 & -4 & 1 \\
-0 & 1 & 0 
-\end{bmatrix}$$
+Rather than maximise average brightness (like traditional auto-exposure), the system maximises edge density, a proxy for sharpness and usable detail.
 
-**How it works at the pixel level:**
-For every pixel, the ESP32-S3 examines its four immediate neighbours (Up, Down, Left, Right):
-1.  It adds the values of the neighbours together.
-2.  It subtracts 4 times the value of the centre pixel.
-3.  **The Result:** If the area is flat (all pixels are the same), the result is **0**. If there is a sharp edge, the result is a high positive or negative number.
+The optimisation loop operates as:
 
----
+ACT → OBSERVE → SCORE → UPDATE → REPEAT
 
-#### 3. Why the Variance?
-The output of the Laplacian filter is a new "edge map" image. However, the Bayesian Optimiser requires a single number (a Scalar) to determine if the photo is good or bad. We calculate the **Variance** ($\sigma^2$) of this edge map to measure the "spread" of the data.
+Each minute:
 
-
-
-* **Low Variance (Blurry/Badly Exposed):** Most pixels in the edge map are close to zero. There is no contrast and the statistical "spread" is tiny.
-* **High Variance (Sharp/Well Exposed):** The edge map contains a wide range of values—some very dark, some very bright—representing many crisp edges and high contrast.
+1. Select next exposure via UCB
+2. Apply manual exposure
+3. Capture grayscale QVGA frame
+4. Compute edge-density score
+5. Update surrogate model
 
 ---
 
-#### 4. Why this is the "Engineer's Choice"
-This metric is chosen because it is both **Robust** and **Cheap**:
+# Objective Function (Embedded Variant)
 
-* **Computationally Efficient:** It only requires basic addition and multiplication. It avoids square roots and trigonometry, making it perfect for the ESP32-S3's architecture.
-* **Illumination Invariant-ish:** Because it is a derivative, it ignores the "DC Offset" (global brightness) and focuses solely on the "AC Component" (the edges).
-* **Single Peak (Unimodal):** For a given scene, as you vary exposure from dark to light, the Laplacian Variance typically follows a "Bell Curve". This makes it exceptionally easy for Bayesian Optimisation to locate the global peak.
+Instead of a full 3×3 Laplacian convolution and variance calculation, this implementation uses a 1D gradient magnitude approximation:
 
+
+### Why This Choice?
+
+- O(n) complexity
+- No convolution kernel
+- No additional frame buffer
+- No floating-point heavy operations
+- No square roots
+- Stable on long runs
+- Works well in practice for exposure tuning
+
+While not a mathematically pure Laplacian variance, it captures the same principle:
+
+> More edge contrast = better exposure.
 
 ---
 
-## Getting Started
+# Surrogate Model
 
-1.  **Library Dependencies:**
-    * `esp_camera` (Standard Espressif library)
-    * `BayesianOptimization` (C++ implementation for Arduino/ESP32)
-2.  **Configuration:**
-    * Set `PIXFORMAT_GRAYSCALE` for maximum processing throughput.
-    * Allocate the Bayesian object using `ps_malloc` to ensure it resides in PSRAM.
+The optimiser uses a squared exponential kernel:
+
+k(x1, x2) = exp( - (x1 - x2)^2 / (2l^2) )
+
+
+However, this is not a full GP posterior.
+
+Instead of computing:
+
+μ(x) = kᵀ K⁻¹ y
+σ²(x) = k(x,x) - kᵀ K⁻¹ k
+
+
+This implementation uses a simplified accumulation model:
+
+mean ≈ Σ k(x, xi) * yi
+variance ≈ 1 - Σ k(x, xi)^2
+
+
+This provides:
+
+- Smooth interpolation
+- Exploration capability
+- Convergence behaviour
+- Minimal RAM footprint
+- No matrix inversion
+
+It is an embedded approximation of GP behaviour.
+
+---
+
+# Why UCB Instead of Expected Improvement?
+
+UCB was chosen because:
+
+- No need for posterior CDF
+- No Gaussian distribution assumptions
+- No error function (`erf`)
+- Deterministic computation
+- Very stable numerically
+- Efficient on embedded cores
+
+For microcontrollers, predictability is more important than theoretical purity.
+
+---
+
+# Hardware Requirements
+
+- Board: Seeed Studio XIAO ESP32-S3 Sense
+- Sensor: OV2640
+- Frame Size: QVGA Grayscale
+- Memory: 8MB PSRAM recommended (for frame buffers)
+
+---
+
+# Why Not Use Standard Auto-Exposure?
+
+Traditional auto-exposure:
+
+- Targets mid-grey
+- Fails in HDR/backlit conditions
+- Optimises brightness, not detail
+- Can overexpose highlights or crush shadows
+
+This system:
+
+- Ignores global luminance
+- Maximises edge response
+- Naturally avoids blown highlights
+- Converges to a detail-rich exposure
+
+For plant timelapse, structural detail matters more than brightness averages.
+
+---
+
+# Why This Approach Is Ideal for Timelapse
+
+- Exposure stabilises after convergence
+- Adapts slowly to lighting drift
+- Deterministic 1-minute interval execution
+- No cloud dependency
+- No Wi-Fi required
+- No PC required
+- Runs indefinitely without memory growth
+
+The design prioritises:
+
+- Stability
+- Predictability
+- Embedded efficiency
+- Low power operation
+
+---
+
+# Summary
+
+BO-S3 (Embedded Variant) is:
+
+A pragmatic, resource-aware Bayesian-inspired exposure optimiser designed specifically for long-duration autonomous operation on the XIAO ESP32-S3 Sense.
+
+It is inspired by Gaussian Process Bayesian Optimisation but deliberately simplified to meet embedded engineering constraints.
+
+This is not academic GP research software.
+
+It is engineered firmware.
+
