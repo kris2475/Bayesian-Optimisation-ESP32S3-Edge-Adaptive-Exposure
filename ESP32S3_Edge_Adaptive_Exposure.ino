@@ -1,24 +1,57 @@
-/**
- * @file ESP32_Edge_Adaptive_Exposure.ino
- * @project BO-S3: Edge Adaptive Exposure
- * @date 2026-02-17
- * * DESCRIPTION:
- * This sketch implements an on-device Bayesian Optimisation (BO) loop to automate
- * camera exposure and gain tuning. Unlike standard "Auto" modes, it maximises
- * "Image Detail" (Laplacian Variance) rather than average brightness.
- * * ENGINEERING CONTEXT:
- * Developed for the Seeed Studio XIAO ESP32-S3 Sense.
- * Uses 8MB PSRAM for the Gaussian Process matrix and frame buffers.
- * Objective Function: Statistical Variance of the 2D Discrete Laplacian.
- * * DESIGNED FOR: 
- * High-stakes "one-shot" scenarios, where the system 
- * must find the global maximum of a black-box function in minimum iterations.
- */
+/**************************************************************************************
+ *
+ *  BO_Adaptive_Exposure_Timelapse_Grayscale.ino
+ *
+ *  Target Hardware:
+ *      Seeed Studio XIAO ESP32S3 + Sense Shield (SPI SD slot)
+ *
+ *  Software Environment:
+ *      Arduino ESP32 Core 2.0.17
+ *      Built-in esp32-camera driver (ESP-IDF 4.4.x based)
+ *
+ *  -----------------------------------------------------------------------------------
+ *  PURPOSE
+ *  -----------------------------------------------------------------------------------
+ *  Stable timelapse capture of plants with **Bayesian Optimised exposure** for maximum sharpness.
+ *  Uses **SPI SD (Sense Shield slot)** and **grayscale QVGA** to avoid DMA/PSRAM conflicts.
+ *
+ *  - Camera initialised once at setup
+ *  - SD initialised once at setup
+ *  - Frames saved as raw grayscale .pgm (lightweight)
+ *  - Edge-density scoring feeds Bayesian Optimisation for each frame
+ *  - Timelapse interval: 1 minute
+ *
+ *  -----------------------------------------------------------------------------------
+ *  FEATURES
+ *  -----------------------------------------------------------------------------------
+ *      • Disables auto exposure control
+ *      • Bayesian Optimisation using UCB
+ *      • Grayscale QVGA frames
+ *      • Edge-density scoring (1D gradient)
+ *      • Timelapse-ready SD saving (SPI)
+ *      • Fixed memory footprint
+ *
+ *  -----------------------------------------------------------------------------------
+ *  SETTINGS
+ *  -----------------------------------------------------------------------------------
+ *      • MAX_SAMPLES       : Max BO observations
+ *      • LENGTH_SCALE      : Kernel length scale for BO
+ *      • KAPPA             : UCB exploration factor
+ *      • MIN_EXPOSURE      : Min camera exposure
+ *      • MAX_EXPOSURE      : Max camera exposure
+ *      • EXPOSURE_STEP     : Step size for candidate exposures
+ *      • TIMELAPSE_INTERVAL: Interval between frames (ms)
+ *
+ **************************************************************************************/
 
 #include "esp_camera.h"
-#include <BayesianOptimization.h>
+#include "Arduino.h"
+#include "SD.h"
+#include <math.h>
 
-// --- Camera Configuration ---
+/*==============================================================================*/
+/*  Camera Pin Definitions (XIAO ESP32S3)                                      */
+/*==============================================================================*/
 #define PWDN_GPIO_NUM     -1
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM     10
@@ -36,143 +69,209 @@
 #define HREF_GPIO_NUM     47
 #define PCLK_GPIO_NUM     13
 
-// --- Project Constants ---
-const int MAX_ITERATIONS = 20; // Limit due to O(N^3) matrix inversion complexity
-int current_iter = 0;
+/*==============================================================================*/
+/*  SPI SD Pin Definitions (Sense Shield)                                      */
+/*==============================================================================*/
+#define SD_CS   21
+#define SD_SCK  7
+#define SD_MISO 8
+#define SD_MOSI 9
 
-// Bayesian Space: Dim 0 = Exposure (aec_value), Dim 1 = Gain (agc_value)
-float min_bounds[] = {10.0, 0.0};
-float max_bounds[] = {1200.0, 30.0};
-BayesianOptimization bo(2); // 2-dimensional optimisation
+/*==============================================================================*/
+/*  Bayesian Optimization Parameters                                           */
+/*==============================================================================*/
+static const int MAX_SAMPLES      = 25;
+static const float LENGTH_SCALE   = 150.0f;
+static const float KAPPA          = 2.0f;
+static const float MIN_EXPOSURE   = 20.0f;
+static const float MAX_EXPOSURE   = 1200.0f;
+static const float EXPOSURE_STEP  = 20.0f;
 
-void setup() {
-  Serial.begin(115200);
-  
-  // 1. Initialise Camera
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sscb_sda = SIOD_GPIO_NUM;
-  config.pin_sscb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size = FRAMESIZE_QVGA; // 320x240 for fast processing
-  config.pixel_format = PIXFORMAT_GRAYSCALE; // Direct luminance access
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM; // Use XIAO's PSRAM
-  config.fb_count = 1;
+float obs_exposure[MAX_SAMPLES];
+float obs_score[MAX_SAMPLES];
+int total_samples = 0;
 
-  if (esp_camera_init(&config) != ESP_OK) {
-    Serial.println("Camera Init Failed");
-    while (true);
-  }
+/*==============================================================================*/
+/*  Timelapse Interval                                                          */
+/*==============================================================================*/
+static const unsigned long TIMELAPSE_INTERVAL = 60000; // 1 minute
+unsigned long lastCapture = 0;
 
-  // 2. Disable Hardware Auto-Exposure/Gain to hand control to BO
-  sensor_t * s = esp_camera_sensor_get();
-  s->set_aec_mode(s, 0); // Manual Exposure
-  s->set_agc_mode(s, 0); // Manual Gain
-
-  // 3. Initialise Bayesian Bounds
-  bo.setBounds(min_bounds, max_bounds);
-  
-  Serial.println("BO-S3 System Ready. Commencing Optimisation Loop...");
+/*==============================================================================*/
+/*  Squared Exponential Kernel                                                  */
+/*==============================================================================*/
+float kernel(float x1, float x2){
+    float diff = x1 - x2;
+    return expf(-(diff*diff)/(2.0f*LENGTH_SCALE*LENGTH_SCALE));
 }
 
-void loop() {
-  if (current_iter < MAX_ITERATIONS) {
-    
-    // Step A: "Think" - Request next optimal test points from Bayesian Engine
-    float* next_guess = bo.propose();
-    int exposure = (int)next_guess[0];
-    int gain = (int)next_guess[1];
+/*==============================================================================*/
+/*  Upper Confidence Bound Acquisition                                          */
+/*==============================================================================*/
+float calculate_next_exposure(){
+    if(total_samples==0) return 100.0f; // initial guess
 
-    // Step B: "Act" - Apply settings to the OV2640 sensor
-    sensor_t * s = esp_camera_sensor_get();
-    s->set_aec_value(s, exposure);
-    s->set_agc_value(s, gain);
-    
-    // Allow sensor to settle (CMOS charge time)
-    delay(500);
+    float best_x = MIN_EXPOSURE;
+    float max_ucb = -1e9f;
 
-    // Step C: "Observe" - Capture frame and evaluate quality
-    camera_fb_t * fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Frame Capture Failed");
-      return;
+    for(float x=MIN_EXPOSURE;x<=MAX_EXPOSURE;x+=EXPOSURE_STEP){
+        float mean=0.0f,var=1.0f;
+        for(int i=0;i<total_samples;i++){
+            float k = kernel(x, obs_exposure[i]);
+            mean += k*obs_score[i];
+            var  -= k*k;
+        }
+        float variance = (var>0.1f)?var:0.1f;
+        float ucb = mean + KAPPA*sqrtf(variance);
+        if(ucb>max_ucb){
+            max_ucb=ucb;
+            best_x=x;
+        }
+    }
+    return best_x;
+}
+
+/*==============================================================================*/
+/*  Camera Initialization                                                       */
+/*==============================================================================*/
+bool setup_camera(){
+    camera_config_t config;
+
+    config.ledc_channel = LEDC_CHANNEL_0;
+    config.ledc_timer   = LEDC_TIMER_0;
+
+    config.pin_d0 = Y2_GPIO_NUM; config.pin_d1 = Y3_GPIO_NUM;
+    config.pin_d2 = Y4_GPIO_NUM; config.pin_d3 = Y5_GPIO_NUM;
+    config.pin_d4 = Y6_GPIO_NUM; config.pin_d5 = Y7_GPIO_NUM;
+    config.pin_d6 = Y8_GPIO_NUM; config.pin_d7 = Y9_GPIO_NUM;
+
+    config.pin_xclk  = XCLK_GPIO_NUM;
+    config.pin_pclk  = PCLK_GPIO_NUM;
+    config.pin_vsync = VSYNC_GPIO_NUM;
+    config.pin_href  = HREF_GPIO_NUM;
+
+    config.pin_sccb_sda = SIOD_GPIO_NUM;
+    config.pin_sccb_scl = SIOC_GPIO_NUM;
+
+    config.pin_pwdn  = PWDN_GPIO_NUM;
+    config.pin_reset = RESET_GPIO_NUM;
+
+    config.xclk_freq_hz = 20000000;
+    config.pixel_format = PIXFORMAT_GRAYSCALE; // lighter than JPEG
+    config.frame_size   = FRAMESIZE_QVGA;
+    config.fb_count     = 1; // single framebuffer for stability
+    config.fb_location  = CAMERA_FB_IN_PSRAM;
+    config.grab_mode    = CAMERA_GRAB_LATEST;
+
+    esp_err_t err = esp_camera_init(&config);
+    if(err != ESP_OK){
+        Serial.printf("Camera init failed: 0x%x\n", err);
+        return false;
     }
 
-    float sharpness_score = calculate_laplacian_variance(fb->buf, fb->width, fb->height);
-    
-    // Step D: "Learn" - Feed result back into Gaussian Process
-    bo.update(next_guess, sharpness_score);
-    
-    // Clean up frame buffer
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_exposure_ctrl(s,0); // disable auto exposure
+
+    return true;
+}
+
+/*==============================================================================*/
+/*  SPI SD Initialization                                                      */
+/*==============================================================================*/
+bool setup_sd(){
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    if(!SD.begin(SD_CS)){
+        Serial.println("SD Card Mount Failed (SPI)");
+        return false;
+    }
+    delay(50);
+    return true;
+}
+
+/*==============================================================================*/
+/*  Edge-Density Scoring                                                        */
+/*==============================================================================*/
+float compute_edge_density(camera_fb_t *fb){
+    uint32_t edge_sum = 0;
+    for(size_t i=0;i<fb->len-1;i++)
+        edge_sum += abs((int)fb->buf[i] - (int)fb->buf[i+1]);
+    return (float)edge_sum / (float)fb->len;
+}
+
+/*==============================================================================*/
+/*  Setup                                                                       */
+/*==============================================================================*/
+void setup(){
+    Serial.begin(115200);
+    delay(2000);
+    Serial.println("\n--- Bayesian Adaptive Exposure Timelapse (SPI SD) ---");
+
+    if(!setup_sd()){
+        Serial.println("ERROR: SD mount failed! Check SD card.");
+        while(true);
+    }
+    Serial.println("SD Card ready (SPI)");
+
+    if(!setup_camera()){
+        Serial.println("ERROR: Camera init failed! Check connections.");
+        while(true);
+    }
+    Serial.println("Camera OK");
+
+    Serial.println("\n--- System Ready: Camera + SD verified ---");
+    lastCapture = millis() - TIMELAPSE_INTERVAL; // first capture immediately
+}
+
+/*==============================================================================*/
+/*  Main Loop                                                                   */
+/*==============================================================================*/
+void loop(){
+    if(millis() - lastCapture < TIMELAPSE_INTERVAL) return;
+    lastCapture = millis();
+
+    // Determine optimal exposure
+    float optimal_exposure = calculate_next_exposure();
+    sensor_t *s = esp_camera_sensor_get();
+    s->set_aec_value(s, round(optimal_exposure));
+    delay(250); // settle
+
+    // Capture frame
+    camera_fb_t *fb = esp_camera_fb_get();
+    if(!fb){
+        Serial.println("Frame capture failed");
+        return;
+    }
+
+    float score = compute_edge_density(fb);
+
+    // Save as .pgm (grayscale raw)
+    String filename = "/plant_" + String(millis()) + ".pgm";
+    File file = SD.open(filename.c_str(), FILE_WRITE);
+    if(file){
+        file.write(fb->buf, fb->len);
+        file.close();
+        Serial.println("Saved: " + filename);
+    } else {
+        Serial.println("SD write failed: " + filename);
+    }
+
+    // Feed BO
+    if(total_samples < MAX_SAMPLES){
+        obs_exposure[total_samples] = optimal_exposure;
+        obs_score[total_samples] = score;
+        total_samples++;
+    } else {
+        for(int i=0;i<MAX_SAMPLES-1;i++){
+            obs_exposure[i]=obs_exposure[i+1];
+            obs_score[i]=obs_score[i+1];
+        }
+        obs_exposure[MAX_SAMPLES-1]=optimal_exposure;
+        obs_score[MAX_SAMPLES-1]=score;
+    }
+
     esp_camera_fb_return(fb);
 
-    // Progress Output
-    Serial.printf("Iter: %d | Exp: %d | Gain: %d | Score: %.2f\n", current_iter, exposure, gain, sharpness_score);
-    
-    current_iter++;
-  } else {
-    // Optimisation Complete
-    float* best_params = bo.getBestX();
-    Serial.println("--- OPTIMISATION COMPLETE ---");
-    Serial.printf("Optimal Exposure: %d\n", (int)best_params[0]);
-    Serial.printf("Optimal Gain: %d\n", (int)best_params[1]);
-    
-    // Stay at best settings
-    sensor_t * s = esp_camera_sensor_get();
-    s->set_aec_value(s, (int)best_params[0]);
-    s->set_agc_value(s, (int)best_params[1]);
-    
-    while(1); // Stop
-  }
+    Serial.printf("Iter: %02d | Exposure: %6.1f | Edge Score: %6.2f\n",
+                  total_samples, optimal_exposure, score);
 }
 
-/**
- * CALCULATE LAPLACIAN VARIANCE
- * ----------------------------
- * Computes the statistical variance of the 2D Laplacian.
- * Acts as a proxy for high-frequency detail (sharpness).
- */
-float calculate_laplacian_variance(uint8_t* buffer, int width, int height) {
-  long sum = 0;
-  long sq_sum = 0;
-  int count = 0;
-
-  for (int y = 1; y < height - 1; y++) {
-    for (int x = 1; x < width - 1; x++) {
-      // Discrete Convolution Kernel: [0, 1, 0][1, -4, 1][0, 1, 0]
-      int center = buffer[y * width + x];
-      int neighbors = buffer[(y - 1) * width + x] + 
-                      buffer[(y + 1) * width + x] + 
-                      buffer[y * width + (x - 1)] + 
-                      buffer[y * width + (x + 1)];
-      
-      int laplacian = neighbors - (4 * center);
-      
-      sum += laplacian;
-      sq_sum += (long)laplacian * laplacian;
-      count++;
-    }
-  }
-
-  // Engineering formula for Variance: E[X^2] - (E[X])^2
-  float mean = (float)sum / count;
-  float variance = ((float)sq_sum / count) - (mean * mean);
-  
-  return variance;
-}
