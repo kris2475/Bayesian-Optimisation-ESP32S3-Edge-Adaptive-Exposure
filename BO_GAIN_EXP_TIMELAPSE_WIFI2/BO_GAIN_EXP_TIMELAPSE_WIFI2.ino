@@ -40,8 +40,8 @@
 #include <math.h>
 
 /*========================= NETWORK =========================*/
-#define WIFI_SSID  "SKYYRMR7"
-#define WIFI_PASS  "K2xWvDFZkuCh"
+#define WIFI_SSID  " "
+#define WIFI_PASS  " "
 
 /*========================= SPI SD ==========================*/
 #define SD_CS   21
