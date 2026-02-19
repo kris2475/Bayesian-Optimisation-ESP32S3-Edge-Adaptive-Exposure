@@ -1,17 +1,34 @@
 /**************************************************************************************
- *
- *  BO_Adaptive_Exposure_Gain_Timelapse_Persistent_NTP_FIXED.ino
- *
- *  FULLY CORRECTED VERSION
- *
- *  Fixes Applied:
- *      ✔ Explicit SPI SD init retained (required for XIAO ESP32-S3 Sense)
- *      ✔ Proper PGM header written (previous version saved raw buffer only)
- *      ✔ Gain correctly mapped to OV2640 integer domain (0–30)
- *      ✔ constrain() used on exposure/gain before applying
- *      ✔ No logic removed
- *      ✔ Persistent BO retained
- *
+ * PROJECT: Adaptive Exposure & Gain Timelapse (XIAO ESP32-S3 Sense)
+ * FILE:    BO_Adaptive_Exposure_Gain_Timelapse_Persistent_NTP_FIXED.ino
+ * * ⚠️ IMPORTANT: NOT FORMAL BAYESIAN OPTIMIZATION (BO) ⚠️
+ * This script implements a "Heuristic BO-Inspired" acquisition loop. It is NOT a 
+ * formal statistical Bayesian Optimization framework (e.g., no Gaussian Process 
+ * regression, no Cholesky decomposition, and no formal marginal likelihood 
+ * maximization). It uses a simplified Radial Basis Function (RBF) kernel 
+ * approximation to estimate mean and variance for an Upper Confidence Bound (UCB) 
+ * decision-making process.
+ * * VERSION: FULLY CORRECTED & STABILIZED
+ * * SUMMARY OF CORE LOGIC:
+ * 1.  INTENT: Automate camera exposure and gain settings to maximize image 
+ * "quality" (defined as high edge-contrast and target-mean brightness).
+ * 2.  PERSISTENCE: Saves the "BO" state (historical samples and scores) to 
+ * microSD (/bo_state.dat) to survive reboots/power cycles.
+ * 3.  TIME: Synchronizes via NTP once at boot to provide human-readable 
+ * ISO-8601 filenames.
+ * 4.  HARDWARE: Specifically tuned for the XIAO ESP32-S3 Sense (SPI SD config).
+ * * KEY FIXES APPLIED:
+ * - SPI INITIALIZATION: Explicitly defines SCK/MISO/MOSI/CS for the XIAO expansion board.
+ * - PGM COMPLIANCE: Prepends the necessary P5 header (Magic Number, Dim, MaxVal) 
+ * to the raw buffer.
+ * - SENSOR MAPPING: Maps float gain (0.0-5.0) to OV2640 register domain (0-30).
+ * - SAFETY: Applies strict constrain() calls to prevent invalid register writes.
+ * * COMPUTATIONAL METHODOLOGY:
+ * - Search Space: 2D Grid Search (Exposure x Gain).
+ * - Objective Function: Edge detection (pixel-to-pixel delta) minus a brightness 
+ * deviation penalty.
+ * - Acquisition: Upper Confidence Bound (UCB) where Score = Mean + (Kappa * StdDev).
+ * * DATE: February 19, 2026
  **************************************************************************************/
 
 #include "esp_camera.h"
