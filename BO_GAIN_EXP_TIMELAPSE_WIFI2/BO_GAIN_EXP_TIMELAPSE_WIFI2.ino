@@ -1,6 +1,6 @@
 /**************************************************************************************
  * PROJECT: Adaptive Exposure & Gain Timelapse (XIAO ESP32-S3 Sense)
- * FILE:    BO_Adaptive_Exposure_Gain_Timelapse_Persistent_NTP_FIXED.ino
+ * FILE:    BO_GAIN_EXP_TIMELAPSE_WIFI2.ino
  * * ⚠️ IMPORTANT: NOT FORMAL BAYESIAN OPTIMIZATION (BO) ⚠️
  * This script implements a "Heuristic BO-Inspired" acquisition loop. It is NOT a 
  * formal statistical Bayesian Optimization framework (e.g., no Gaussian Process 
