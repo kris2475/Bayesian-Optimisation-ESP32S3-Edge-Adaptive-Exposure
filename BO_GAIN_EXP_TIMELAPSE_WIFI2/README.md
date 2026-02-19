@@ -1,6 +1,6 @@
 # Adaptive Exposure & Gain Timelapse (XIAO ESP32-S3 Sense)
 
-### `BO_Adaptive_Exposure_Gain_Timelapse_Persistent_NTP_FIXED.ino`
+### `BO_GAIN_EXP_TIMELAPSE_WIFI2.ino`
 
 ---
 
